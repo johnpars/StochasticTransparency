@@ -42,7 +42,6 @@ public static class ShaderIDs
 {
     public static readonly int _MSAASampleCount   = Shader.PropertyToID("_MSAASampleCount");
     public static readonly int _StochasticTexture = Shader.PropertyToID("_StochasticTexture");
-    public static readonly int _AlphaMaskTexture  = Shader.PropertyToID("_AlphaMaskTexture");
 }
 
 public class StochasticRasterizerInstance : RenderPipeline
@@ -56,6 +55,7 @@ public class StochasticRasterizerInstance : RenderPipeline
     
     // RT 
     RTHandle m_ColorBuffer;
+    RTHandle m_BackgroundBuffer;
     RTHandle m_StochasticColorBuffer;
     RTHandle m_DepthStencilBuffer;
     RTHandle m_TransmissionBuffer;
@@ -68,12 +68,7 @@ public class StochasticRasterizerInstance : RenderPipeline
     // Accumulation: Settings
     StochasticRasterizer.AccumulationMode m_AccumulationMode;
     int m_AccumulationIterations;
-
-    //Stochastic Sampling
-    private const int k_SampleDim  = 128;
-    private const int k_Iterations = 256;
-    private const int k_PatternShift = 4;
-
+    
     static readonly System.Random m_Random = new System.Random();
 
     // Engine Materials
@@ -96,7 +91,8 @@ public class StochasticRasterizerInstance : RenderPipeline
 
         InitializeBuffers();
 
-        m_FinalPass = CoreUtils.CreateEngineMaterial(Shader.Find("Hidden/StochasticTransparency/FinalPass"));
+        // Our final pass is stored in Pass 4 of stochastic material.
+        m_FinalPass = CoreUtils.CreateEngineMaterial(Shader.Find("StochasticRasterizer/UnlitStochastic"));
     }
 
     private void InitializeBuffers()
@@ -104,11 +100,19 @@ public class StochasticRasterizerInstance : RenderPipeline
         m_ColorBuffer = RTHandles.Alloc(Vector2.one, 
                                         colorFormat: SystemInfo.GetGraphicsFormat(UnityEngine.Experimental.Rendering.DefaultFormat.HDR),
                                         enableMSAA: true,
+                                        bindTextureMS: false,
                                         name: "ColorBuffer");
+
+        m_BackgroundBuffer = RTHandles.Alloc(Vector2.one,
+                                colorFormat: SystemInfo.GetGraphicsFormat(UnityEngine.Experimental.Rendering.DefaultFormat.HDR),
+                                enableMSAA: true,
+                                bindTextureMS: true, //NOTE: We resolve on final pass
+                                name: "BackgroundBuffer");
 
         m_StochasticColorBuffer = RTHandles.Alloc(Vector2.one,
                                                   colorFormat: SystemInfo.GetGraphicsFormat(UnityEngine.Experimental.Rendering.DefaultFormat.HDR),
                                                   enableMSAA: true,
+                                                  bindTextureMS: false, //NOTE: We want to resolve before final pass
                                                   name: "StochasticColorBuffer");
 
         m_DepthStencilBuffer = RTHandles.Alloc(Vector2.one,
@@ -119,6 +123,7 @@ public class StochasticRasterizerInstance : RenderPipeline
         m_TransmissionBuffer = RTHandles.Alloc(Vector2.one,
                                           colorFormat: UnityEngine.Experimental.Rendering.GraphicsFormat.R16_SFloat,
                                           enableMSAA: true,
+                                          bindTextureMS: true, // NOTE: We resolve on final pass
                                           name: "TransmissionBuffer"); // NOTE: No MSAA on opacity for now.
 
         // Alloc History Buffers
@@ -179,10 +184,13 @@ public class StochasticRasterizerInstance : RenderPipeline
 
                 //3.) Stochastic Colors
                 RenderStochasticColors(sortingSettings, drawSettings, filterSettings, cull, context);
+
+                //4.) Final Pass
+                RenderFinalPass(context, 0, camera);
             }
             //------------------------------------------------------------------------------------
             
-            CommandBuffer cmd = CommandBufferPool.Get("FinalPass");
+            CommandBuffer cmd = CommandBufferPool.Get("PostProcessing");
 
             // Post Process
             var postProcessLayer = camera.GetComponent<PostProcessLayer>();
@@ -195,33 +203,7 @@ public class StochasticRasterizerInstance : RenderPipeline
             cmd.Blit(m_ColorBuffer, BuiltinRenderTextureType.CameraTarget);
             context.ExecuteCommandBuffer(cmd);
             CommandBufferPool.Release(cmd);
-
-            /*
-#if true
-            int iterations = Application.isPlaying && m_AccumulationMode == StochasticRasterizer.AccumulationMode.Finite ? m_AccumulationIterations : 1;
-            for(int i = 0; i < iterations; ++i)
-            { 
-                //Clear
-                ClearBuffers(context);
-
-                //Total transmittance
-                RenderTransmittance(sortingSettings, drawSettings, filterSettings, cull, context);
-
-                //Sky
-                DrawSkybox(camera, context);
-
-                //Shader Inputs
-                PushShadingConstants(camera, context, i);
-
-                //Stochastic
-                RenderStochasticTransparency(sortingSettings, drawSettings, filterSettings, cull, context);
-
-                //Final Pass    
-                RenderFinalPass(context, i, camera);
-            }
-            PresentAccumulation(context);
-#endif      */
-
+            
             context.Submit();
         }
     }
@@ -231,23 +213,6 @@ public class StochasticRasterizerInstance : RenderPipeline
         var stochasticRasterizer = GraphicsSettings.renderPipelineAsset as StochasticRasterizer;
         m_AccumulationMode = stochasticRasterizer.accumulationMode;
         m_AccumulationIterations = stochasticRasterizer.accumulationIterations;
-    }
-
-    private void ClearBuffers(ScriptableRenderContext context)
-    {
-        CommandBuffer cmd = CommandBufferPool.Get("Clear");
-        
-        cmd.SetRenderTarget(m_TransmissionBuffer);
-        cmd.ClearRenderTarget(true, true, Color.white);
-
-        cmd.SetRenderTarget(m_ColorBuffer);
-        cmd.ClearRenderTarget(true, true, Color.clear);
-
-        cmd.SetRenderTarget(m_DepthStencilBuffer);
-        cmd.ClearRenderTarget(true, false, Color.black);
-
-        context.ExecuteCommandBuffer(cmd);
-        CommandBufferPool.Release(cmd);
     }
 
     private Texture2D GetBlueNoise(int index)
@@ -267,37 +232,10 @@ public class StochasticRasterizerInstance : RenderPipeline
         return Texture2D.whiteTexture; 
     }
 
-    private void PresentAccumulation(ScriptableRenderContext context)
-    {
-        CommandBuffer cmd = CommandBufferPool.Get("Present Accumulation");
-
-        if(!Application.isPlaying || m_AccumulationMode == StochasticRasterizer.AccumulationMode.Disabled)
-        {
-            cmd.Blit(m_ColorBuffer, BuiltinRenderTextureType.CameraTarget);
-        }
-        else
-        { 
-            cmd.Blit(m_HistoryBuffers[m_HistoryDestIndex], BuiltinRenderTextureType.CameraTarget);
-        
-            // Clear history in case of finite accumulation
-            if(m_AccumulationMode == StochasticRasterizer.AccumulationMode.Finite)
-            { 
-                for(int i = 0; i < 2; ++i)
-                {
-                    cmd.SetRenderTarget(m_HistoryBuffers[i]);
-                    cmd.ClearRenderTarget(false, true, Color.black);
-                }
-            }
-        }
-
-        context.ExecuteCommandBuffer(cmd);
-        CommandBufferPool.Release(cmd);
-    }
-
     private void DrawSkybox(Camera camera, ScriptableRenderContext context)
     {
         CommandBuffer cmd = new CommandBuffer() { name = "Draw Sky" };
-        cmd.SetRenderTarget(m_ColorBuffer, m_DepthStencilBuffer);
+        cmd.SetRenderTarget(m_BackgroundBuffer, m_DepthStencilBuffer);
         context.ExecuteCommandBuffer(cmd);
         cmd.Release();
             
@@ -310,41 +248,9 @@ public class StochasticRasterizerInstance : RenderPipeline
         CommandBuffer cmd = CommandBufferPool.Get("Push");
 
         cmd.SetGlobalInt(ShaderIDs._MSAASampleCount, k_MSAASamples);
-
-        if(m_AccumulationMode == StochasticRasterizer.AccumulationMode.Continuous)
-        {
-            cmd.SetGlobalTexture(ShaderIDs._StochasticTexture, GetBlueNoise(Time.renderedFrameCount % 64));
-            cmd.SetGlobalFloat("_Jitter", Time.time);
-        }
-        else if (m_AccumulationMode == StochasticRasterizer.AccumulationMode.Finite)
-        {
-            //TODO: Blue Noise
-            //cmd.SetGlobalTexture(ShaderIDs._StochasticTexture, GetBlueNoise());
-            //cmd.SetGlobalFloat("_SubframeIndex", iteration % k_PatternShift);
-
-            cmd.SetGlobalTexture(ShaderIDs._StochasticTexture, GetBlueNoise(iteration % 64));
-            cmd.SetGlobalFloat("_Jitter", iteration * 100);
-        }
-        else
-        {
-            cmd.SetGlobalTexture(ShaderIDs._StochasticTexture, GetBlueNoise(Time.renderedFrameCount % 64));
-        }
-
+        cmd.SetGlobalTexture(ShaderIDs._StochasticTexture, GetBlueNoise(Time.renderedFrameCount % 64));
         cmd.SetGlobalVector("_BlueNoiseParams", new Vector4((float)camera.pixelWidth / (float)64f, (float)camera.pixelHeight / (float)64f, 
                                                             (float)m_Random.NextDouble(), (float)m_Random.NextDouble()));
-
-        var stochasticRasterizer = GraphicsSettings.renderPipelineAsset as StochasticRasterizer;
-        if (stochasticRasterizer != null)
-        {
-            if(stochasticRasterizer.randomMask != null)
-            {
-                cmd.SetGlobalTexture("_Randoms", stochasticRasterizer.randomMask);
-            }
-            else
-            {
-                cmd.SetGlobalTexture("_Randoms", Texture2D.whiteTexture);
-            }
-        }
 
         context.ExecuteCommandBuffer(cmd);
         cmd.Clear();
@@ -411,80 +317,21 @@ public class StochasticRasterizerInstance : RenderPipeline
         filterSettings.renderQueueRange = RenderQueueRange.opaque;
         context.DrawRenderers(cull, ref drawSettings, ref filterSettings);
     }
-
-    private void RenderStochasticTransparency(SortingSettings sortingSettings, DrawingSettings drawSettings, FilteringSettings filterSettings,
-                                         CullingResults cull, ScriptableRenderContext context)
-    {
-        CommandBuffer cmd = CommandBufferPool.Get("Stochastic");
-
-        //Set Color RT
-        cmd.SetRenderTarget(m_ColorBuffer, m_DepthStencilBuffer);
-        cmd.SetGlobalInt(ShaderIDs._MSAASampleCount, k_MSAASamples);
-
-        context.ExecuteCommandBuffer(cmd);
-        CommandBufferPool.Release(cmd);
-
-        //Opaque objects
-        sortingSettings.criteria = SortingCriteria.CommonOpaque;
-        drawSettings.sortingSettings = sortingSettings;
-        drawSettings.SetShaderPassName(0, m_StochasticColorPassName);
-        filterSettings.renderQueueRange = RenderQueueRange.opaque;          
-        context.DrawRenderers(cull, ref drawSettings, ref filterSettings);
-    }
+    
 
     private void RenderFinalPass(ScriptableRenderContext context, int iteration, Camera camera)
     {
         CommandBuffer cmd = CommandBufferPool.Get("FinalPass");
 
-        if(Application.isPlaying)
-        { 
-            // Ping-pong indices
-            if(m_AccumulationMode == StochasticRasterizer.AccumulationMode.Continuous)
-            {
-                m_HistorySourceIndex = (Time.frameCount + 0) % 2;
-                m_HistoryDestIndex   = (Time.frameCount + 1) % 2;
-                
-                cmd.SetGlobalFloat("_AccumulationWeight", 0.99f);
-            }
-            else
-            {
-                m_HistorySourceIndex = (iteration + 0) % 2;
-                m_HistoryDestIndex   = (iteration + 1) % 2;
+        // NOTE: 1x AA
+        cmd.SetGlobalTexture("_StochasticColorBuffer", m_StochasticColorBuffer);
 
-                // TODO: Note
-                //if(iteration == 0)
-                //    cmd.SetGlobalFloat("_AccumulationWeight", 0f);
-                //else
-                    cmd.SetGlobalFloat("_AccumulationWeight", 1f - (1f / (float)m_AccumulationIterations));
-            }
-
-            // Post Process
-            var postProcessLayer = camera.GetComponent<PostProcessLayer>();
-            if(postProcessLayer != null)
-            {
-                RenderPostProcess(postProcessLayer, cmd, camera);
-            }
-
-            cmd.SetGlobalTexture("_ColorBuffer",   m_ColorBuffer); 
-            cmd.SetGlobalTexture("_HistoryBuffer", m_HistoryBuffers[m_HistorySourceIndex]);
-            CoreUtils.DrawFullScreen(cmd, m_FinalPass, m_HistoryBuffers[m_HistoryDestIndex], m_ColorBuffer);
-        }
-        else
-        {
-            //TODO: Final Pass here still needs opacity buffer for final resolve.
-            // Post Process
-            var postProcessLayer = camera.GetComponent<PostProcessLayer>();
-            if(postProcessLayer != null)
-            {
-                RenderPostProcess(postProcessLayer, cmd, camera);
-            }
-            else
-            {
-                cmd.Blit(m_ColorBuffer, BuiltinRenderTextureType.CameraTarget);
-            }
-        }
-
+        // NOTE: MSAA
+        cmd.SetGlobalTexture("_TransmissionBuffer", m_TransmissionBuffer);
+        cmd.SetGlobalTexture("_BackgroundBuffer", m_BackgroundBuffer);
         
+        CoreUtils.DrawFullScreen(cmd, m_FinalPass, m_ColorBuffer, shaderPassId: 3);
+
         context.ExecuteCommandBuffer(cmd);
         CommandBufferPool.Release(cmd);
     }
@@ -509,6 +356,7 @@ public class StochasticRasterizerInstance : RenderPipeline
     protected override void Dispose(bool disposing)
     {
         RTHandles.Release(m_ColorBuffer);
+        RTHandles.Release(m_BackgroundBuffer);
         RTHandles.Release(m_StochasticColorBuffer);
         RTHandles.Release(m_DepthStencilBuffer);
         RTHandles.Release(m_TransmissionBuffer);

@@ -9,20 +9,25 @@ SAMPLER(sampler_StochasticTexture);
 float4 _BlueNoiseParams;
 int _MSAASampleCount;
 
-struct VertexInput
-{
-    float4 vertex : POSITION;
-};
-
 struct Interpolators
 {
     float4 positionCS : SV_POSITION;
+	float2 texcoord   : TEXCOORD0;
 };
 
-Interpolators Vertex(VertexInput i)
+Interpolators VertexFullScreen(uint vertexID : SV_VertexID)
+{
+	Interpolators o;
+	o.positionCS = GetFullScreenTriangleVertexPosition(vertexID);
+	o.texcoord   = GetFullScreenTriangleTexCoord(vertexID);
+	return o;
+}
+
+Interpolators Vertex(float4 vertex : POSITION, float2 texcoord : TEXCOORD0)
 {
     Interpolators o;
-    o.positionCS = TransformObjectToHClip(i.vertex.xyz);
+    o.positionCS = TransformObjectToHClip(vertex.xyz);
+	o.texcoord = texcoord;
     return o;
 }
 
@@ -71,4 +76,35 @@ uint FragmentStochasticDepths(Interpolators i, uint primitiveID : SV_PrimitiveID
 float4 FragmentStochasticColors(Interpolators i) : SV_Target
 {
     return float4(_Color.rgb * _Color.a, _Color.a);
+}
+
+//-------------------------------------------------------------------------
+//4.) Final Pass
+//-------------------------------------------------------------------------
+Texture2DMS<float,  8> _TransmissionBuffer;
+Texture2DMS<float4, 8> _BackgroundBuffer;
+Texture2D<float4>	   _StochasticColorBuffer;
+
+float4 FragmentFinalPass(Interpolators i) : SV_Target
+{
+	float3 resolvedBackgroundColor = 0.0;
+	float  resolvedTransmittance   = 0.0;
+
+	[unroll]
+	for (int sampleId = 0; sampleId < 8; ++sampleId)
+	{
+		float T = _TransmissionBuffer.Load(i.positionCS.xy, sampleId).r;
+		resolvedBackgroundColor += T * _BackgroundBuffer.Load(i.positionCS.xy, sampleId).rgb;
+		resolvedTransmittance   += T;
+	}
+
+	// TODO: Currently hardcoded MSAA Samples.
+	resolvedBackgroundColor *= 1.0 / 8.0;
+	resolvedTransmittance   *= 1.0 / 8.0;
+
+	// NOTE: At the moment, we only accumulate/simulate 1x8MSAA sample.
+	float4 resolvedTransparenctColor = _StochasticColorBuffer.Load(int3(i.positionCS.xy, 0));
+	resolvedTransparenctColor *= ((1.0 - resolvedTransmittance) / resolvedTransparenctColor.a); // Alpha Correction
+
+	return float4(resolvedTransparenctColor.rgb + resolvedBackgroundColor.rgb, 1.0);
 }
